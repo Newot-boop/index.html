@@ -1,0 +1,1090 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+INSPECCION DE SEGURIDAD · CHERNOBYL & FUKUSHIMA (8-bit)  ->  MP4
+==================================================================
+Port a video del HTML/Canvas original. Todo se genera por codigo:
+no necesita recursos externos (sin red, sin imagenes, sin audio).
+
+ESPECIFICACIONES TECNICAS
+-------------------------
+Video
+  * Contenedor / codec : MP4 · H.264 (libx264, CRF 18, yuv420p, faststart)
+  * Resolucion         : 1280 x 720 (16:9)
+  * Lienzo logico      : 160 x 90 px (pixel-art), escalado x8 "nearest"
+  * Cuadros por seg.   : 30 fps
+  * Duracion           : 52 s (6 + 13 + 13 + 13 + 7)
+
+Audio
+  * Codec              : AAC 192 kbps, estereo, 44.1 kHz
+  * Sintesis           : 100 % procedural (ondas cuadradas/triangulo/
+                         seno/ruido, filtros, reverb por convolucion)
+  * Capas              : musica 8-bit (arpegio + bajo), latidos de tension,
+                         efectos sincronizados con cada evento visual,
+                         contador Geiger, sirenas, explosion, tsunami,
+                         "tick" de maquina de escribir en el texto.
+
+Escenas (tiempo global)
+  00:00-00:06  BRIEFING            (intro, simbolo radiactivo)
+  00:06-00:19  CASO 01-A CHERNOBYL (NUEVA: envenenamiento por xenon-135, 13 s)
+  00:19-00:32  CASO 01-B CHERNOBYL (sala de control 6.5 s + explosion 6.5 s)
+  00:32-00:45  CASO 02 FUKUSHIMA   (terremoto/tsunami 6.5 s + enfriamiento 6.5 s)
+  00:45-00:52  CIERRE              (ficha tecnica)
+
+Efectos anadidos sobre los sprites (respecto al HTML)
+  * Halo pulsante, orbitas y estela de barrido en el simbolo radiactivo.
+  * Chispas al apagarse cada indicador, estela de movimiento y chispazo
+    en la palanca, aguja temblorosa y vibracion de camara con la alarma.
+  * Explosion: destello con decaimiento, onda de choque en anillo, sacudida
+    de camara, aberracion cromatica, brasas con estela, escombros con estela.
+  * Fukushima: polvo/escombros durante el sismo, arcos electricos en los
+    generadores, espuma salpicando en la cresta de la ola, destellos en el mar.
+  * Enfriamiento: resplandor del nucleo, burbujas, arcos en sala inundada,
+    chispas al fallar la bomba.
+  * Cierre: chispas en cada check y confeti pixel al final.
+  * Escena nueva Xenon: neutrones que son absorbidos por atomos de xenon
+    (destello violeta), barras de control que se retiran, medidores de
+    potencia/xenon/ORM, burbujas de vapor y vibracion al volverse inestable.
+  * Global: bloom (brillo), lineas CRT, vineta, fundido de entrada/salida,
+    barra de progreso, HUD con texto tipo maquina de escribir.
+
+Uso:   python3 render_inspeccion_8bit.py  [salida.mp4]
+Requiere: ffmpeg, numpy, scipy, opencv-python, Pillow.
+"""
+import math, os, subprocess, sys, tempfile
+import numpy as np
+import cv2
+from PIL import Image, ImageDraw, ImageFont
+from scipy import signal
+from scipy.io import wavfile
+
+OUT = sys.argv[1] if len(sys.argv) > 1 else "inspeccion_seguridad_8bit.mp4"
+
+W, H = 160, 90
+SCALE = 8
+VW, VH = W * SCALE, H * SCALE
+FPS = 30
+SR = 44100
+
+SCENES = [
+    dict(dur=6, tag='BRIEFING · 00', title='INSPECCIÓN DE SEGURIDAD',
+         desc='Vas a revisar dos secuencias de accidentes nucleares. Observá los errores logísticos.',
+         q='Ficha técnica: ¿qué decisión falló en cada caso?'),
+    dict(dur=13, tag='CASO 01-A · CHERNOBYL · 1986', title='ENVENENAMIENTO POR XENÓN',
+         desc='Al caer la potencia a ~30 MW, el xenón-135 se acumuló y absorbió neutrones. Para compensar, sacaron casi todas las barras de control.',
+         q='¿Qué margen mínimo de barras de control y de potencia debía exigirse antes de continuar la prueba?'),
+    dict(dur=13, tag='CASO 01-B · CHERNOBYL · 1986', title='PRUEBA NO AUTORIZADA',
+         desc='Durante una prueba se desactivaron sistemas de protección del reactor. Quedó inestable y explotó.',
+         q='¿Qué control o autorización debía exigirse antes de desactivar los sistemas de seguridad?'),
+    dict(dur=13, tag='CASO 02 · FUKUSHIMA · 2011', title='GENERADORES INUNDADOS',
+         desc='El tsunami inundó los generadores de emergencia. Sin energía se perdió el enfriamiento.',
+         q='¿Dónde debían ubicarse los generadores y bombas de reserva para resistir la inundación?'),
+    dict(dur=7, tag='CIERRE · FICHA TÉCNICA', title='COMPLETÁ TU FICHA TÉCNICA',
+         desc='Caso / error logístico / método de seguridad que faltó.',
+         q='Compará ambos casos: ¿qué medida de seguridad habría evitado los dos?'),
+]
+STARTS = [0, 6, 19, 32, 45]
+TOTAL = sum(s['dur'] for s in SCENES)
+NFR = TOTAL * FPS
+TYPE_START, TYPE_CPS = 0.45, 60.0     # maquina de escribir
+
+# =========================================================
+# 1. MOTOR DE DIBUJO 8-BIT (buffer logico 160x90)
+# =========================================================
+buf = np.zeros((H, W, 3), np.float32)
+fx = dict(shift=(0, 0), bloom=1.0, chroma=0.0)
+_cc = {}
+
+def col(c):
+    if c not in _cc:
+        _cc[c] = np.array([int(c[1:3], 16), int(c[3:5], 16), int(c[5:7], 16)], np.float32)
+    return _cc[c]
+
+def _rd(v):
+    return int(math.floor(v + 0.5))
+
+def r(x, y, w, h, c, a=1.0):
+    x0, y0 = _rd(x), _rd(y)
+    x1, y1 = x0 + _rd(w), y0 + _rd(h)
+    x0, y0 = max(0, x0), max(0, y0)
+    x1, y1 = min(W, x1), min(H, y1)
+    if x1 <= x0 or y1 <= y0:
+        return
+    if a >= 1:
+        buf[y0:y1, x0:x1] = col(c)
+    else:
+        buf[y0:y1, x0:x1] = buf[y0:y1, x0:x1] * (1 - a) + col(c) * a
+
+def clear(c):
+    r(-6, -6, W + 12, H + 12, c)
+
+def fill_alpha(c, a):
+    buf[:] = buf * (1 - a) + col(c) * a
+
+def disc(cx, cy, rad, c, a=1.0):
+    y = -rad
+    while y <= rad + 1e-9:
+        hw = int(math.floor(math.sqrt(max(0, rad * rad - y * y))))
+        r(_rd(cx - hw), _rd(cy + y), hw * 2 + 1, 1, c, a)
+        y += 1
+
+def line(x0, y0, x1, y1, c, th=1, a=1.0):
+    x0, y0, x1, y1 = _rd(x0), _rd(y0), _rd(x1), _rd(y1)
+    dx, dy = abs(x1 - x0), abs(y1 - y0)
+    sx = 1 if x0 < x1 else -1
+    sy = 1 if y0 < y1 else -1
+    err = dx - dy
+    for _ in range(400):
+        r(x0, y0, th, th, c, a)
+        if x0 == x1 and y0 == y1:
+            break
+        e2 = 2 * err
+        if e2 > -dy:
+            err -= dy; x0 += sx
+        if e2 < dx:
+            err += dx; y0 += sy
+
+def rnd(i):
+    x = math.sin(i * 127.1 + 311.7) * 43758.5453
+    return x - math.floor(x)
+
+def ring(cx, cy, rad, c, a=1.0):
+    n = int(2 * math.pi * rad * 1.3) + 8
+    for k in range(n):
+        ang = 2 * math.pi * k / n
+        r(cx + math.cos(ang) * rad, cy + math.sin(ang) * rad, 1, 1, c, a)
+
+def sparks(cx, cy, age, seed, n=8, speed=25.0, life=0.4,
+           cols=('#fff7a0', '#facc15', '#ffffff')):
+    if age < 0 or age > life:
+        return
+    for k in range(n):
+        ang = rnd(seed * 13 + k) * 2 * math.pi
+        sp = speed * (0.45 + rnd(seed * 7 + k + 3))
+        x = cx + math.cos(ang) * sp * age
+        y = cy + math.sin(ang) * sp * age + 28 * age * age
+        r(x, y, 1, 1, cols[k % len(cols)], max(0.0, 1 - age / life))
+
+# --- Simbolo radiactivo pre-renderizado (mascara 35x35) ---
+TRE = np.zeros((35, 35), bool)
+for _y in range(35):
+    for _x in range(35):
+        _dx, _dy = _x - 17, _y - 17
+        _d = math.hypot(_dx, _dy)
+        _a = math.degrees(math.atan2(_dy, _dx)) % 360
+        _blade = False
+        for _b in (90, 210, 330):
+            _dd = abs(_a - _b)
+            if _dd > 180:
+                _dd = 360 - _dd
+            if _dd <= 30:
+                _blade = True
+        TRE[_y, _x] = (_d <= 3) or (_blade and 7 <= _d <= 16)
+
+def blit_mask(mask, x, y, n, c):
+    idx = (np.arange(n) * mask.shape[0]) // n
+    sub = mask[np.ix_(idx, idx)]
+    x0, y0 = _rd(x), _rd(y)
+    for yy in range(n):
+        py = y0 + yy
+        if 0 <= py < H:
+            xs = np.nonzero(sub[yy])[0] + x0
+            xs = xs[(xs >= 0) & (xs < W)]
+            buf[py, xs] = col(c)
+
+# =========================================================
+# 2. ESCENAS
+# =========================================================
+def draw_intro(t):
+    clear('#060a11')
+    for x in range(0, W, 8): r(x, 0, 1, H, '#0c1420')
+    for y in range(0, H, 8): r(0, y, W, 1, '#0c1420')
+    sy = (t * 22) % H
+    for k in range(1, 8):                                  # estela de barrido
+        r(0, sy - k, W, 1, '#16324a', 0.55 * (1 - k / 8))
+    r(0, sy, W, 1, '#1f4a6b')
+    s = 1 + math.sin(t * 3) * 0.08
+    disc(80, 40, 22 + math.sin(t * 3) * 3, '#facc15', 0.09)      # halo
+    disc(80, 40, 28 + math.sin(t * 3) * 3, '#facc15', 0.04)
+    for k in range(6):                                     # orbitas
+        for tr in range(5):
+            ang = t * 1.6 + k * math.pi / 3 - tr * 0.09
+            r(80 + math.cos(ang) * 29, 40 + math.sin(ang) * 17 * 0.9 + 0, 1, 1,
+              '#22d3ee', 0.9 * (1 - tr / 5))
+    blit_mask(TRE, 80 - 17 * s, 40 - 17 * s, _rd(35 * s), '#facc15')
+    if math.sin(t * 6) > 0:
+        r(0, 0, W, 1, '#22d3ee'); r(0, H - 1, W, 1, '#22d3ee')
+        r(0, 0, 1, H, '#22d3ee'); r(W - 1, 0, 1, H, '#22d3ee')
+    fx['bloom'] = 1.1
+
+def chernobyl_control(t):
+    clear('#080b12')
+    r(0, 0, W, 56, '#0f141d')
+    r(10, 8, 140, 38, '#1a2130')
+    r(10, 8, 140, 2, '#2a3446')
+    off = min(12, int(t * 2.3))
+    for i in range(12):
+        cx = 20 + (i % 6) * 22
+        cy = 20 + (i // 6) * 14
+        r(cx - 3, cy - 3, 12, 10, '#0b1017')
+        isoff = i < off
+        blink = math.sin(t * 12 + i * 1.7) > 0
+        if isoff: c = '#ef4444' if blink else '#7f1d1d'
+        else:     c = '#22c55e' if blink else '#14532d'
+        r(cx, cy, 6, 4, c)
+        sparks(cx + 3, cy + 2, t - (i + 1) / 2.3, i, n=6, speed=24, life=0.35,
+               cols=('#ff8a8a', '#ffffff', '#ef4444'))
+    r(0, 54, W, 36, '#171d2b')
+    r(0, 54, W, 2, '#323c52')
+    for i in range(9):
+        x = 8 + i * 10
+        r(x, 62, 7, 7, '#0b1017')
+        r(x + 1, 63, 5, 5, '#ef4444' if i < off / 2 else '#475569')
+    gx, gy = 30, 78
+    r(gx - 13, gy - 11, 26, 18, '#0b1017')
+    na = -math.pi * 0.8 + min(1, t / 5.5) * math.pi * 1.5
+    if t > 4.2:
+        na += (rnd(int(t * 30)) - 0.5) * 0.18                  # aguja temblorosa
+    for k in range(3): r(gx - 12 + k * 12, gy - 9, 1, 2, '#334155')
+    line(gx, gy, gx + math.cos(na) * 10, gy + math.sin(na) * 10, '#f59e0b', 1)
+    # palanca
+    def lever_a(tt): return -0.5 + min(1, max(0, (tt - 2) / 1)) * 1.4
+    a = lever_a(t)
+    px, py = 134, 76
+    r(px - 4, py - 2, 9, 5, '#0b1017')
+    if 2 < t < 3.2:                                            # estela
+        for k in range(1, 5):
+            ak = lever_a(t - k * 0.04)
+            line(px, py, px + math.sin(ak) * 15, py - math.cos(ak) * 15, '#94a3b8', 2, 0.28 / k * 2)
+    hx, hy = px + math.sin(a) * 15, py - math.cos(a) * 15
+    line(px, py, hx, hy, '#94a3b8', 2)
+    disc(hx, hy, 2, '#ef4444')
+    sparks(hx, hy, t - 3.0, 90, n=10, speed=30, life=0.4)
+    if t > 4.2:
+        b = 0.16 if math.sin(t * 14) > 0 else 0.04
+        fill_alpha('#ef4444', b)
+        r(0, 0, W, 2, '#ef4444'); r(0, H - 2, W, 2, '#ef4444')
+    if t > 5.0:
+        k = int(t * 30)
+        fx['shift'] = (int(round((rnd(k) - .5) * 2)), int(round((rnd(k + 7) - .5) * 2)))
+    fx['bloom'] = 1.1
+
+def chernobyl_explosion(t):
+    clear('#070a10')
+    for i in range(26):
+        x, y = rnd(i) * W, rnd(i + 50) * 40
+        if math.sin(t * 2 + i) > 0: r(x, y, 1, 1, '#2b3448')
+    r(0, 72, W, 18, '#11151c')
+    boom = t > 1.0
+    p = t - 1
+    # sacudida de camara
+    k = int(t * 30)
+    amp = 0.0
+    if t > 0.5 and not boom: amp = 0.8
+    if t > 0.95: amp = 3.6 * math.exp(-max(p, 0) * 1.5)
+    if amp > 0.4:
+        fx['shift'] = (int(round((rnd(k) - .5) * 2 * amp)), int(round((rnd(k + 7) - .5) * 2 * amp)))
+    r(45, 36, 70, 36, '#39414f')
+    r(45, 36, 70, 2, '#4a5364')
+    r(45, 36, 2, 36, '#2c3341')
+    r(113, 36, 2, 36, '#2c3341')
+    if not boom: r(62, 14, 9, 22, '#4a5364')
+    else:        r(62, 26, 9, 10, '#3a4250')
+    if not boom:
+        r(43, 31, 74, 5, '#525b6b')
+    else:
+        for i in range(8):
+            r(45 + i * 9, 33 - rnd(i) * 5, 7, 3, '#2f3644')
+    for i in range(7):
+        for j in range(2):
+            r(50 + i * 9, 44 + j * 10, 4, 4, '#1b202a' if boom else '#facc15')
+    if 0.95 < t < 1.18:
+        fill_alpha('#ffffff', 0.9)
+        fx['bloom'] = 2.0
+        return
+    if boom:
+        disc(80, 70, 24 + math.sin(t * 6) * 3, '#ff6a00', 0.12)
+        disc(80, 70, 36 + math.sin(t * 5) * 3, '#ff6a00', 0.05)
+        for i in range(46):
+            seed = rnd(i)
+            life = (p * 0.55 + seed) % 1
+            x = 44 + seed * 72 + math.sin(p * 2 + i) * 4
+            y = 72 - life * 66
+            sz = 1 + int(life * 3)
+            c = ('#ffb020' if life < .30 else '#ff5a1a' if life < .55
+                 else '#7a3b1a' if life < .78 else '#4a5260')
+            r(x, y, sz, sz, c)
+        for i in range(16):                                    # brasas con estela
+            seed = rnd(i + 100)
+            for tr in range(4):
+                life = (p * 0.9 - tr * 0.025 + seed) % 1
+                x = 80 + (seed - 0.5) * 110 * (0.3 + life)
+                y = 72 - life * 80 + 30 * life * life
+                r(x, y, 1, 1, '#ffd27a', 0.9 * (1 - life) * (1 - tr / 4))
+        if p < 2.2:                                            # escombros + estela
+            for i in range(16):
+                vx = (rnd(i) - 0.5) * 95
+                vy = -45 - rnd(i + 9) * 55
+                for tr in range(4):
+                    d = p - tr * 0.03
+                    if d < 0: continue
+                    x = 80 + vx * d
+                    y = 58 + vy * d + 55 * d * d
+                    if y < 92:
+                        r(x, y, 2, 2, '#8b93a3', 1.0 if tr == 0 else 0.35 / tr)
+        if 0 < p < 1.5:                                        # onda de choque
+            ring(80, 66, p * 78, '#ffe9b0', 0.85 * (1 - p / 1.5))
+            ring(80, 66, p * 78 - 2, '#ff8a3a', 0.5 * (1 - p / 1.5))
+        if p < 0.6:
+            fill_alpha('#ffb060', 0.35 * (1 - p / 0.6))
+        if math.sin(t * 12) > 0:
+            r(0, 0, W, 1, '#ef4444'); r(0, H - 1, W, 1, '#ef4444')
+        fx['bloom'] = 1.0 + 1.0 * math.exp(-p * 1.2)
+        fx['chroma'] = max(0.0, 1 - p * 1.6)
+
+def draw_chernobyl(t):
+    if t < 6.5: chernobyl_control(t)
+    else:       chernobyl_explosion(t - 6.5)
+
+def fukushima_wave(t):
+    if t < 2.4:
+        k = int(t * 24)
+        fx['shift'] = (_rd((rnd(k) - 0.5) * 3), _rd((rnd(k + 7) - 0.5) * 2))
+    r(-6, -6, W + 12, 24, '#1c2734')
+    r(-6, -6, W + 12, 40, '#243444')
+    r(-6, -6, W + 12, 56, '#2c3e50')
+    for i in range(6):
+        cx = ((i * 41 + t * 3) % 190) - 15
+        r(cx, 10 + (i % 3) * 9, 20, 3, '#3a4b5e')
+    r(-6, 52, W + 12, 44, '#0f2740')
+    for i in range(7):
+        y = 55 + i * 5
+        for x in range(0, W, 16):
+            off = math.sin(t * 2 + x * 0.1 + i) * 3
+            r(x + off, y, 8, 1, '#16395c')
+    for i in range(10):                                        # destellos
+        if math.sin(t * 4 + i * 2.3) > 0.85:
+            r(rnd(i + 70) * 70, 54 + rnd(i + 80) * 30, 2, 1, '#9ec8e8', 0.7)
+    r(72, 50, 94, 46, '#252a31')
+    r(72, 50, 94, 2, '#343b45')
+    r(92, 30, 24, 26, '#4e5866'); r(92, 30, 24, 2, '#64707f')
+    r(120, 24, 26, 32, '#4e5866'); r(120, 24, 26, 2, '#64707f')
+    r(150, 34, 14, 22, '#4e5866'); r(150, 34, 14, 2, '#64707f')
+    for i in range(3):
+        for j in range(2):
+            r(97 + i * 7, 38 + j * 8, 3, 3, '#facc15' if t < 4.2 else '#3a4351')
+    r(74, 60, 18, 11, '#0b1017')
+    r(75, 61, 16, 9, '#c9a227')
+    r(76, 62, 14, 2, '#f0c94a')
+    if t < 4.4: r(76, 66, 3, 2, '#22c55e')
+    if 3.2 < t < 4.6 and math.sin(t * 37) > -0.2:              # arcos electricos
+        k = int(t * 24)
+        line(76 + rnd(k) * 14, 61, 76 + rnd(k + 4) * 14, 71, '#fff7a0', 1)
+        line(76 + rnd(k + 9) * 14, 61, 76 + rnd(k + 2) * 14, 71, '#7dd3fc', 1)
+    if t > 2:
+        p = min(1, (t - 2) / 4.2)
+        fw = min(170, 16 + p * 195)
+        topY = 88 - p * 44
+        r(-6, topY, fw + 6, 96 - topY, '#1a4b78')
+        r(-6, topY, fw + 6, 3, '#69a8d8')
+        r(fw - 7, topY, 9, 96 - topY, '#2a6ea8')
+        r(fw - 2, topY, 4, 96 - topY, '#8fc6ee')
+        for i in range(28):
+            r(rnd(i) * (fw - 4), topY + 4 + rnd(i + 11) * (88 - topY), 2, 1, '#b9dcf5')
+        if fw < 168:                                           # salpicaduras
+            for i in range(16):
+                life = (t * 1.6 + rnd(i)) % 1
+                x = fw - 5 + (rnd(i + 3) - 0.3) * 12 + life * 4
+                y = topY - math.sin(life * math.pi) * 11
+                r(x, y, 2, 2, '#dff1ff', 0.9 * (1 - life * 0.5))
+    if t > 4.6 and math.sin(t * 12) > -0.3:
+        line(76, 61, 90, 71, '#ef4444', 2)
+        line(90, 61, 76, 71, '#ef4444', 2)
+        r(0, 0, W, 1, '#ef4444')
+    if t < 2.4:                                                # polvo / escombros
+        for i in range(16):
+            x = rnd(i) * W
+            y = (t * 40 * (0.5 + rnd(i + 9)) + rnd(i + 3) * 90) % 90
+            r(x, y, 1, 1, '#6b7688', 0.9)
+    fx['bloom'] = 1.0
+
+def fukushima_cooling(t):
+    clear('#080b12')
+    for x in range(0, W, 10): r(x, 0, 1, H, '#0d121c')
+    for y in range(0, H, 10): r(0, y, W, 1, '#0d121c')
+    r(14, 16, 44, 56, '#1a2130')
+    r(14, 16, 44, 2, '#2a3446')
+    r(14, 16, 2, 56, '#2a3446')
+    heat = min(1, t / 5.2)
+    cc = ('#22c55e' if heat < .45 else '#a3e635' if heat < .72
+          else '#facc15' if heat < .88 else '#ef4444')
+    disc(36, 44, 11, '#0b1017')
+    disc(36, 44, 9, cc)
+    disc(36, 44, 14 + math.sin(t * 5) * 1.5, cc, 0.12 * heat + 0.04)   # resplandor
+    if heat > 0.7 and math.sin(t * 10) > 0:
+        disc(36, 44, 13, '#ef4444', 0.35)
+    r(58, 42, 38, 3, '#475569')
+    powered = t < 3.0
+    if powered:
+        for i in range(6):
+            r(60 + ((i * 6 + t * 18) % 34), 42, 2, 3, '#22d3ee')
+    r(96, 36, 14, 14, '#1a2130')
+    r(96, 36, 14, 2, '#2a3446')
+    if powered:
+        a = t * 12
+        line(103, 43, 103 + math.cos(a) * 5, 43 + math.sin(a) * 5, '#22d3ee', 1)
+    else:
+        line(99, 39, 107, 47, '#ef4444', 1)
+        line(107, 39, 99, 47, '#ef4444', 1)
+        sparks(103, 43, t - 3.0, 120, n=9, speed=22, life=0.4)
+    r(118, 34, 38, 50, '#1a2130')
+    r(118, 34, 38, 2, '#2a3446')
+    r(118, 34, 2, 50, '#2a3446')
+    r(124, 56, 26, 14, '#0b1017')
+    r(125, 57, 24, 12, '#c9a227')
+    r(126, 58, 22, 3, '#f0c94a')
+    if powered: r(127, 64, 3, 2, '#22c55e')
+    wl = max(0, min(1, (t - 1.2) / 2.2))
+    if wl > 0:
+        wTop = 82 - wl * 36
+        r(120, wTop, 34, 84 - wTop, '#1d4e7a')
+        r(120, wTop, 34, 1, '#7fb6e0')
+        for i in range(10):
+            fy = wTop + 3 + rnd(i + 5) * (80 - wTop)
+            if fy < 82: r(121 + rnd(i) * 32, fy, 1, 1, '#3b82f6')
+        for i in range(9):                                     # burbujas
+            life = (t * 0.8 + rnd(i)) % 1
+            r(122 + rnd(i + 20) * 30, 82 - life * (wl * 36), 1, 1, '#a7d3f5', 0.8)
+        if 1.4 < t < 3.6 and math.sin(t * 29 + 1) > 0.2:       # arcos en agua
+            k = int(t * 25)
+            line(121 + rnd(k) * 32, 52 + rnd(k + 2) * 18, 121 + rnd(k + 5) * 32, 52 + rnd(k + 8) * 18,
+                 '#fff7a0', 1)
+    if t > 4:
+        for i in range(14):
+            life = ((t - 4) * 0.7 + rnd(i)) % 1
+            x = 20 + rnd(i + 3) * 34 + math.sin(t * 2 + i) * 2
+            y = 16 - life * 14
+            if y > -4: r(x, y, 2, 2, '#4a5260' if life > .5 else '#6b7280')
+    if t > 3.4:
+        b = 0.14 if math.sin(t * 14) > 0 else 0.03
+        fill_alpha('#ef4444', b)
+        r(0, 0, W, 2, '#ef4444'); r(0, H - 2, W, 2, '#ef4444')
+    if t > 4.0:
+        k = int(t * 30)
+        fx['shift'] = (int(round((rnd(k) - .5) * 2)), int(round((rnd(k + 7) - .5) * 2)))
+    fx['bloom'] = 1.15
+
+def draw_fukushima(t):
+    if t < 6.5: fukushima_wave(t)
+    else:       fukushima_cooling(t - 6.5)
+
+def draw_outro(t):
+    clear('#060a11')
+    for x in range(0, W, 8): r(x, 0, 1, H, '#0c1420')
+    for y in range(0, H, 8): r(0, y, W, 1, '#0c1420')
+    bx, by, bw, bh = 56, 16, 48, 60
+    r(bx, by, bw, bh, '#cfd8e3')
+    r(bx, by, bw, 2, '#eef2f7')
+    r(bx + bw / 2 - 8, by - 5, 16, 7, '#8a97a8')
+    for i in range(3):
+        y = by + 13 + i * 15
+        tc = 0.6 + i * 1.1
+        if t > tc:
+            r(bx + 8, y, 6, 6, '#2b3444')
+            r(bx + 9, y + 1, 4, 4, '#22c55e')
+            r(bx + 18, y + 2, 22, 2, '#8a97a8')
+            sparks(bx + 11, y + 3, t - tc, 40 + i, n=12, speed=24, life=0.6,
+                   cols=('#86efac', '#facc15', '#ffffff'))
+    if t > 3.8:                                                # confeti pixel
+        cs = ('#facc15', '#22d3ee', '#22c55e', '#f472b6')
+        for i in range(34):
+            life = ((t - 3.8) * 0.33 + rnd(i)) % 1
+            x = rnd(i + 60) * W + math.sin(t * 2 + i) * 3
+            r(x, H - life * (H + 8), 2, 2, cs[i % 4], 0.95)
+    if math.sin(t * 6) > 0:
+        r(bx + 8, by + 52, 8, 2, '#facc15')
+    fx['bloom'] = 1.2
+
+
+# --- mini fuente de pixeles (3x5 / 5x5) para los medidores ---
+GLY = {
+ '0': ['111','101','101','101','111'], '1': ['010','110','010','010','111'],
+ '2': ['111','001','111','100','111'], '3': ['111','001','111','001','111'],
+ '4': ['101','101','111','001','001'], '5': ['111','100','111','001','111'],
+ '6': ['111','100','111','101','111'], '7': ['111','001','010','010','010'],
+ '8': ['111','101','111','101','111'], '9': ['111','101','111','001','111'],
+ '-': ['000','000','111','000','000'], 'X': ['101','101','010','101','101'],
+ 'E': ['111','100','110','100','111'], 'O': ['111','101','101','101','111'],
+ 'R': ['110','101','110','101','101'],
+ 'M': ['10001','11011','10101','10001','10001'],
+ 'W': ['10001','10001','10101','11011','10001'],
+}
+def gtext(x, y, s_, c, scale=1, a=1.0):
+    cx = x
+    for ch in s_:
+        g = GLY.get(ch)
+        if g is None:
+            cx += 4 * scale; continue
+        for ry, row in enumerate(g):
+            for rx, v in enumerate(row):
+                if v == '1': r(cx + rx * scale, y + ry * scale, scale, scale, c, a)
+        cx += (len(g[0]) + 1) * scale
+    return cx
+
+def xe_power(t):                      # potencia termica (MW)
+    if t < 1.2: return 700.0
+    if t < 4.0: return 700.0 * (30 / 700.0) ** ((t - 1.2) / 2.8)
+    if t < 4.8: return 30.0
+    if t < 9.0:
+        u = (t - 4.8) / 4.2; u = u * u * (3 - 2 * u); return 30 + 170 * u
+    if t < 10.2: return 200.0
+    u = (t - 10.2) / 2.8
+    return max(20.0, 200 + (40 + 240 * u) * math.sin((t - 10.2) * 8.5))
+
+def xe_xenon(t):                      # nivel de xenon-135 (0..1)
+    u = min(max((t - 1.5) / 3.5, 0), 1); u = u * u * (3 - 2 * u)
+    return min(1.0, 0.06 + 0.88 * u + (0.03 * math.sin(t * 3) if t > 5 else 0))
+
+def xe_rods(t):                       # barras de control equivalentes (ORM)
+    u = min(max((t - 4.8) / 4.2, 0), 1); return 30 - 22 * u
+
+def xe_flow_speed(t):
+    if t < 4.8: return 30.0
+    if t < 9.5: return 42.0
+    return 6.0 + 30.0 * (1 - min(1, (t - 9.5) / 3.5))
+
+def draw_xenon(t):
+    clear('#080b12')
+    for x in range(0, W, 10): r(x, 0, 1, H, '#0d121c')
+    for y in range(0, H, 10): r(0, y, W, 1, '#0d121c')
+    P, X, R = xe_power(t), xe_xenon(t), xe_rods(t)
+    stress = min(max((t - 10.2) / 2.8, 0), 1)
+    # ---- nucleo ----
+    r(26, 10, 88, 53, '#1a2130'); r(26, 10, 88, 2, '#2a3446'); r(26, 10, 2, 53, '#2a3446')
+    if P < 60:    base = '#10201c'
+    elif P < 150: base = '#14532d'
+    elif P < 330: base = '#16a34a'
+    else:         base = '#22c55e'
+    offs = [(1, 1), (4, 2), (2, 4), (4, 4), (1, 3)]
+    kx = int(X * 5 + 0.5)
+    for row in range(6):
+        for c in range(10):
+            idx = row * 10 + c
+            cx, cy = 30 + c * 8, 14 + row * 8
+            cc = base
+            if stress > 0:
+                q = rnd(idx * 3 + int(t * 10))
+                if q < stress * 0.22: cc = '#ef4444'
+                elif q < stress * 0.6: cc = '#facc15'
+            r(cx, cy, 6, 6, cc)
+            for j in range(kx):
+                if rnd(idx * 5 + j + int(t * 5)) < 0.85:
+                    r(cx + offs[j][0], cy + offs[j][1], 1, 1, '#c084fc')
+            if stress > 0 and rnd(idx * 7 + int(t * 9)) < stress * 0.55:
+                r(cx + 2, cy + 2, 2, 2, '#e0f2fe')                    # burbuja de vapor
+    # ---- xenon que se forma (destellos violeta) ----
+    if 1.5 < t < 5.2:
+        for i in range(5):
+            ph = (t * 2.5 + rnd(i + 900)) % 1
+            k = int(t * 2.5 + rnd(i + 900))
+            r(30 + rnd(k * 5 + i) * 78, 14 + rnd(k * 5 + i + 40) * 46, 2, 2, '#e9d5ff', (1 - ph) * 0.85)
+    # ---- neutrones ----
+    nn = int(5 + 22 * min(1, P / 700.0) + (4 if t > 10.2 else 0))
+    for i in range(nn):
+        T = 0.9 + 0.6 * rnd(i + 300)
+        ph = t / T + rnd(i + 400); k = int(ph); f = ph - k
+        sx, sy = 30 + rnd(i * 3 + k) * 80, 14 + rnd(i * 5 + k + 9) * 46
+        ang = rnd(i * 7 + k + 2) * 2 * math.pi
+        Ln = 20 + 10 * rnd(i + 500)
+        absorbed = rnd(i * 11 + k * 3 + 77) < X * 1.05
+        fe = 0.55 if absorbed else 1.0
+        if f > fe:
+            if absorbed and f < fe + 0.15:
+                ex, ey = sx + math.cos(ang) * Ln * fe, sy + math.sin(ang) * Ln * fe
+                if 28 < ex < 110 and 12 < ey < 60:
+                    r(ex - 1, ey - 1, 3, 3, '#e9d5ff', 1 - (f - fe) / 0.15)
+            continue
+        x, y = sx + math.cos(ang) * Ln * f, sy + math.sin(ang) * Ln * f
+        if 28 < x < 111 and 12 < y < 62: r(x, y, 1, 1, '#67e8f9')
+    # ---- barras de control ----
+    ln = 8 + (R / 30.0) * 50
+    for c in (1, 3, 5, 7, 9):
+        x = 30 + c * 8 - 2
+        r(x, 4, 2, 6, '#475569')
+        r(x, 10, 2, ln - 6, '#cbd5e1')
+        r(x, 4 + ln - 3, 2, 3, '#64748b')
+    # ---- panel ORM (izquierda) ----
+    low = R < 15
+    blink = math.sin(t * 10) > 0
+    rc = ('#ef4444' if blink else '#7f1d1d') if low else '#22c55e'
+    gtext(4, 12, 'ORM', '#94a3b8')
+    gtext(4, 20, f"{int(R + 0.5):02d}", rc, scale=2)
+    r(4, 34, 19, 4, '#0b1017'); r(5, 35, int(R / 30 * 17 + .5), 2, rc)
+    r(13, 33, 1, 6, '#facc15')
+    if 4.8 < t < 9.0:
+        o = int(t * 6) % 3
+        r(14, 42 + o, 1, 1, '#facc15'); r(13, 43 + o, 3, 1, '#facc15'); r(12, 44 + o, 5, 1, '#facc15')
+    # ---- panel derecho: potencia y xenon ----
+    r(120, 14, 12, 34, '#0b1017')
+    h = int(min(P, 1000) / 1000 * 30 + .5)
+    pc = '#22c55e' if P >= 650 else ('#ef4444' if (t > 10.2 and P > 300) else '#f59e0b')
+    r(121, 47 - h, 10, h, pc)
+    r(120, 26, 12, 1, '#facc15'); r(120, 17, 12, 1, '#7f1d1d')
+    cx = gtext(114, 5, f"{min(int(P), 999):03d}", '#cbd5e1')
+    gtext(cx + 2, 5, 'MW', '#64748b')
+    r(141, 14, 12, 34, '#0b1017')
+    hx = int(X * 30 + .5)
+    r(142, 47 - hx, 10, hx, '#a855f7'); r(142, 47 - hx, 10, 1, '#e9d5ff')
+    gtext(144, 5, 'XE', '#e9d5ff' if (X > 0.7 and blink) else '#c084fc')
+    # ---- tuberias de refrigerante ----
+    fpos = sum(xe_flow_speed(k * 0.05) * 0.05 for k in range(int(t / 0.05)))
+    r(2, 52, 24, 5, '#0b1017'); r(2, 53, 24, 3, '#1e3a5f')
+    r(114, 52, 44, 5, '#0b1017'); r(114, 53, 44, 3, '#1e3a5f')
+    for i in range(3): r(2 + ((i * 8 + fpos) % 22), 54, 3, 1, '#7dd3fc')
+    for i in range(5): r(114 + ((i * 9 + fpos) % 41), 54, 3, 1, '#7dd3fc')
+    if stress > 0:
+        for i in range(6):
+            if rnd(i + int(t * 6)) < stress: r(114 + rnd(i + 20) * 40, 54, 2, 2, '#e0f2fe')
+    # ---- alarmas ----
+    if low and t < 10.2 and math.sin(t * 14) > 0:
+        r(0, 0, W, 1, '#facc15'); r(0, H - 1, W, 1, '#facc15')
+    if t > 10.2:
+        fill_alpha('#ef4444', 0.15 if math.sin(t * 14) > 0 else 0.04)
+        r(0, 0, W, 2, '#ef4444'); r(0, H - 2, W, 2, '#ef4444')
+        amp = 1 + stress * 1.5; k = int(t * 30)
+        fx['shift'] = (int(round((rnd(k) - .5) * 2 * amp)), int(round((rnd(k + 7) - .5) * 2 * amp)))
+    if t > 12.6:
+        fill_alpha('#ffffff', min(0.8, (t - 12.6) / 0.4 * 0.8))
+    fx['bloom'] = 1.15 + (0.6 if t > 12.6 else 0)
+
+DRAW = [draw_intro, draw_xenon, draw_chernobyl, draw_fukushima, draw_outro]
+
+# =========================================================
+# 3. AUDIO (sintesis procedural)
+# =========================================================
+rng = np.random.default_rng(7)
+N = int(TOTAL * SR)
+AL = np.zeros(N); AR = np.zeros(N); RV = np.zeros(N)
+
+def put(sig, t0, gain=1.0, pan=0.0, rev=0.0):
+    i = int(round(t0 * SR))
+    if i < 0 or i >= N: return
+    seg = sig[:N - i] * gain
+    j = i + len(seg)
+    gl = math.cos((pan + 1) * math.pi / 4) * math.sqrt(2)
+    gr = math.sin((pan + 1) * math.pi / 4) * math.sqrt(2)
+    AL[i:j] += seg * gl; AR[i:j] += seg * gr
+    if rev: RV[i:j] += seg * rev
+
+def osc(kind, f, d=None, duty=0.5):
+    if np.isscalar(f): f = np.full(int(d * SR), float(f))
+    ph = np.cumsum(f) / SR
+    if kind == 'sine': return np.sin(2 * np.pi * ph)
+    if kind == 'sq':   return np.where((ph % 1) < duty, 1.0, -1.0)
+    if kind == 'tri':  return 2 * np.abs(2 * (ph % 1) - 1) - 1
+    if kind == 'saw':  return 2 * (ph % 1) - 1
+
+def env(n, a=0.004, k=6.0, rel=0.01):
+    t = np.arange(n) / SR
+    e = np.minimum(t / max(a, 1e-4), 1) * np.exp(-k * t)
+    rl = max(int(rel * SR), 1)
+    e[-rl:] *= np.linspace(1, 0, min(rl, n))
+    return e
+
+def noise(d): return rng.standard_normal(int(d * SR))
+
+def filt(x, kind, fc, order=2):
+    sos = signal.butter(order, fc, btype=kind, fs=SR, output='sos')
+    return signal.sosfilt(sos, x)
+
+def vary_lp(x, f0, f1, chunks=40):
+    out = np.zeros_like(x); zi = None
+    edges = np.linspace(0, len(x), chunks + 1).astype(int)
+    for c in range(chunks):
+        fc = f0 * (f1 / f0) ** (c / max(chunks - 1, 1))
+        sos = signal.butter(2, min(fc, SR / 2 - 100), btype='low', fs=SR, output='sos')
+        if zi is None: zi = signal.sosfilt_zi(sos) * 0
+        y, zi = signal.sosfilt(sos, x[edges[c]:edges[c + 1]], zi=zi)
+        out[edges[c]:edges[c + 1]] = y
+    return out
+
+def beep(t0, f, d, g=0.1, kind='sq', duty=0.5, k=8.0, pan=0.0, rev=0.0):
+    sig = osc(kind, f, d, duty) * env(int(d * SR), k=k)
+    put(sig, t0, g, pan, rev)
+
+def thump(t0, g=0.2):
+    n = int(0.22 * SR)
+    f = np.linspace(115, 42, n)
+    put(osc('sine', f) * env(n, a=0.002, k=16), t0, g)
+
+def clunk(t0, g=0.3, pan=0.0):
+    n = int(0.16 * SR)
+    s = filt(noise(0.16), 'low', 700) * env(n, a=0.001, k=26)
+    s += osc('sine', np.linspace(130, 55, n)) * env(n, a=0.001, k=22) * 0.9
+    put(s, t0, g, pan, rev=0.15)
+
+def zap(t0, g=0.15):
+    n = int(0.18 * SR)
+    put(osc('sq', np.linspace(2400, 180, n), duty=0.25) * env(n, k=14), t0, g, rev=0.1)
+
+def clicks(t_start, t_end, rate_fn, g=0.1, seed=0):
+    rg = np.random.default_rng(seed)
+    tt = t_start
+    while tt < t_end:
+        tt += 0.002
+        if rg.random() < rate_fn(tt) * 0.002:
+            n = int(0.003 * SR)
+            c = filt(rg.standard_normal(n + 50), 'high', 1500)[:n] * np.exp(-np.arange(n) / (0.0008 * SR))
+            put(c, tt, g * (0.6 + 0.8 * rg.random()), pan=rg.uniform(-.5, .5))
+
+def whoosh(t0, d=0.4, g=0.15, f0=300, f1=6000, up=True):
+    n = int(d * SR)
+    s = vary_lp(noise(d), f0, f1) if up else vary_lp(noise(d), f1, f0)
+    tt = np.linspace(0, 1, n)
+    e = (np.sin(np.pi * tt)) ** 1.5
+    put(s * e, t0, g, rev=0.2)
+
+def siren(t0, t1, offset, hi, lo, g, rate=14.0):
+    n = int((t1 - t0) * SR)
+    tt = t0 + np.arange(n) / SR - offset
+    tgt = np.where(np.sin(tt * rate) > 0, hi, lo).astype(float)
+    f = signal.lfilter([0.002], [1, -0.998], tgt)           # portamento
+    f[:200] = tgt[:200]
+    s = filt(osc('sq', f, duty=0.4), 'low', 3200)
+    e = np.minimum(np.arange(n) / (0.05 * SR), 1) * np.minimum((n - np.arange(n)) / (0.1 * SR), 1)
+    put(s * e, t0, g, rev=0.15)
+
+def music():
+    # ---------- INTRO ----------
+    g0 = 0
+    beep(0.05, np.exp(np.linspace(math.log(150), math.log(1400), int(.3 * SR))), 0.3, 0.12, duty=0.25, k=3)
+    notes = [220.0, 261.63, 329.63, 440.0, 329.63, 261.63]
+    for k in range(int(5.4 / 0.2)):
+        beep(0.4 + k * 0.2, notes[k % 6], 0.17, 0.05, duty=0.25, k=10, pan=-0.3 + 0.1 * (k % 6), rev=0.15)
+    for k in range(11):
+        beep(0.4 + k * 0.5, 110.0 if k % 4 != 3 else 98.0, 0.45, 0.13, kind='tri', k=3)
+    for tp in (4.09,):
+        beep(tp, 1800, 0.14, 0.05, kind='sine', k=10, rev=0.4)
+    whoosh(5.6, 0.45, 0.14)
+    # drone
+    d = 6.0
+    put(osc('saw', 55.0, d) * filt(np.ones(int(d * SR)), 'low', 200) * 0 + filt(osc('saw', 55.0, d), 'low', 220) * 0.12, 0, 1)
+
+    xenon_audio()
+    # ---------- CHERNOBYL: SALA DE CONTROL (19.0 - 25.5) ----------
+    g0 = 19.0
+    tb = 0.3
+    while tb < 6.4:
+        thump(g0 + tb, 0.22); thump(g0 + tb + 0.13, 0.11)
+        tb += 1.0 - 0.65 * (tb / 6.5)
+    for i in range(12):
+        toff = (i + 1) / 2.3
+        pan = ((20 + (i % 6) * 22) - 80) / 80 * 0.6
+        beep(g0 + toff, 1100 - i * 55, 0.09, 0.075, duty=0.25, pan=pan, rev=0.15)
+        n = int(0.01 * SR)
+        put(filt(noise(0.01), 'high', 2000) * env(n, a=0.0005, k=200), g0 + toff, 0.12, pan)
+    n = int(5.5 * SR); tt = np.arange(n) / SR
+    f = np.linspace(200, 1400, n)
+    put(osc('sine', f) * (tt / 5.5) ** 2 * 0.06 + osc('tri', f * 1.007) * (tt / 5.5) ** 2 * 0.03, g0, 1)
+    clunk(g0 + 2.0, 0.32, 0.5)
+    clunk(g0 + 3.0, 0.38, 0.5); zap(g0 + 3.0, 0.14)
+    siren(g0 + 4.2, g0 + 6.5, g0, 900, 600, 0.10)
+    d = 6.5
+    put(filt(osc('saw', 46.25, d), 'low', 180) * 0.13, g0, 1)
+
+    # ---------- CHERNOBYL: EXPLOSION (25.5 - 32.0) ----------
+    g0 = 25.5
+    n = int(0.95 * SR); tt = np.arange(n) / SR
+    put(filt(noise(0.95), 'low', 120) * (tt / 0.95) ** 1.5 * 0.9, g0, 0.3)
+    put(osc('sine', np.linspace(700, 2600, n)) * (tt / 0.95) ** 2, g0, 0.08)
+    tb_ = g0 + 0.95
+    put(filt(noise(0.35), 'band' if False else 'high', 400) * env(int(.35 * SR), a=0.001, k=11), tb_, 0.55, rev=0.5)
+    nn = int(3.6 * SR)
+    put(filt(noise(3.6), 'low', 260) * env(nn, a=0.002, k=1.1), tb_, 0.95, rev=0.4)
+    put(osc('sine', np.linspace(95, 26, nn)) * env(nn, a=0.003, k=0.9), tb_, 0.85)
+    clicks(tb_ + 0.1, tb_ + 3.0, lambda t: 90 * math.exp(-(t - tb_) * 0.9), g=0.12, seed=3)
+    put(filt(noise(5.0), 'low', 140) * env(int(5.0 * SR), a=0.5, k=0.5), tb_ + 0.3, 0.30)
+    for i in range(10):
+        ts = tb_ + 0.5 + rnd(i) * 1.6
+        n = int(1.0 * SR)
+        put(osc('sine', np.linspace(2300, 260, n)) * env(n, a=0.02, k=3), ts, 0.025, pan=rnd(i + 3) * 1.6 - .8)
+        n2 = int(0.12 * SR)
+        put(filt(noise(0.12), 'low', 500) * env(n2, a=0.001, k=28), ts + 0.95, 0.12, pan=rnd(i + 3) * 1.6 - .8, rev=0.2)
+    siren(g0 + 1.6, g0 + 6.5, g0, 700, 520, 0.055, rate=12.0)
+    whoosh(31.55, 0.45, 0.15)
+
+    # ---------- FUKUSHIMA: OLA (32.0 - 38.5) ----------
+    g0 = 32.0
+    d = 3.4
+    steps = np.repeat(np.array([0.55 + 0.45 * rnd(k) for k in range(int(d * 24) + 2)]), SR // 24)[:int(d * SR)]
+    tt = np.arange(int(d * SR)) / SR
+    qenv = np.where(tt < 2.4, 1.0, np.exp(-(tt - 2.4) * 4))
+    put(filt(noise(d), 'low', 90) * steps * qenv * 2.2, g0, 0.45)
+    put(osc('sine', 38.0, d) * qenv * steps, g0, 0.35)
+    put(filt(noise(d), 'band', [700, 3200]) * steps * qenv, g0, 0.10, rev=0.15)
+    d = 4.2
+    n = int(d * SR); tt = np.linspace(0, 1, n)
+    put(vary_lp(noise(d), 180, 3500) * tt ** 1.6, g0 + 2.0, 0.55)
+    put(filt(noise(6.5), 'low', 420) * 0.5, g0, 0.05)
+    n = int(1.4 * SR)
+    put(filt(noise(1.4), 'band', [200, 4200]) * env(n, a=0.01, k=2.6), g0 + 3.25, 0.40, pan=0.4, rev=0.35)
+    clicks(g0 + 3.2, g0 + 4.6, lambda t: 40, g=0.10, seed=11)
+    n = int(0.8 * SR)
+    put(osc('sine', np.linspace(500, 40, n)) * env(n, a=0.005, k=3), g0 + 4.2, 0.28)
+    clunk(g0 + 4.2, 0.35)
+    tb_ = 4.6
+    while tb_ < 6.4:
+        beep(g0 + tb_, 880, 0.15, 0.085, duty=0.25, rev=0.15)
+        tb_ += 2 * math.pi / 12
+    n = int(1.6 * SR)
+    put(filt(noise(1.6), 'band', [100, 3500]) * env(n, a=0.03, k=2.0), g0 + 6.2, 0.5, rev=0.5)
+    put(osc('sine', np.linspace(70, 28, n)) * env(n, a=0.005, k=2.5), g0 + 6.2, 0.5)
+
+    # ---------- FUKUSHIMA: ENFRIAMIENTO (38.5 - 45.0) ----------
+    g1 = 38.5
+    put(osc('saw', 49.0, 6.5) * 0 + filt(osc('saw', 49.0, 6.5), 'low', 200) * 0.10, g1, 1)
+    d = 6.5; n = int(d * SR); tt = np.arange(n) / SR
+    put(osc('sine', np.linspace(40, 95, n)) * 0.10 * (tt / d), g1, 1)
+    clicks(g1, g1 + 6.5, lambda t: 2 + 38 * min(1, (t - g1) / 5.2) ** 2, g=0.14, seed=5)
+    d = 3.0; n = int(d * SR); tt = np.arange(n) / SR
+    wob = 110 + 4 * np.sin(tt * 9)
+    put(filt(osc('saw', wob, d), 'low', 500) * 0.10 * np.minimum(tt / 0.1, 1), g1, 1)
+    n = int(0.9 * SR)
+    put(filt(osc('saw', np.linspace(110, 18, n)), 'low', 400) * env(n, a=0.005, k=2.5), g1 + 3.0, 0.14)
+    clunk(g1 + 3.0, 0.30, -0.2)
+    d = 2.2; n = int(d * SR); tt = np.linspace(0, 1, n)
+    put(filt(noise(d), 'band', [1000, 5000]) * (0.4 + 0.6 * tt), g1 + 1.2, 0.10, pan=0.4)
+    siren(g1 + 3.4, g1 + 6.5, g1, 1000, 700, 0.10)
+    tb_ = 3.64
+    while tb_ < 6.4:
+        beep(g1 + tb_, 1400, 0.08, 0.04, kind='sine', k=6)
+        tb_ += 2 * math.pi / 10
+    d = 2.5; n = int(d * SR); tt = np.linspace(0, 1, n)
+    put(filt(noise(d), 'high', 3000) * tt ** 1.3, g1 + 4.0, 0.10, rev=0.2)
+    whoosh(44.55, 0.45, 0.15)
+
+    # ---------- CIERRE (45.0 - 52.0) ----------
+    g0 = 45.0
+    d = 7.0; n = int(d * SR); tt = np.arange(n) / SR
+    pad = np.zeros(n)
+    for fr in (110.0, 164.81, 220.0, 329.63):
+        pad += osc('tri', fr, d) * 0.5
+    put(pad * 0.06 * np.minimum(tt / 1.0, 1) * (1 + 0.15 * np.sin(tt * 2.2)), g0, 1, rev=0.2)
+    chimes = [(1046.5, 1318.5), (1318.5, 1568.0), (1568.0, 2093.0)]
+    for i, (f1, f2) in enumerate(chimes):
+        tc = g0 + 0.6 + i * 1.1
+        beep(tc, f1, 0.06, 0.12, duty=0.25, k=4, rev=0.3)
+        beep(tc + 0.06, f2, 0.35, 0.12, duty=0.25, k=5, rev=0.4)
+    for k, fr in enumerate((523.25, 659.25, 783.99, 1046.5)):
+        beep(g0 + 3.9 + k * 0.09, fr, 0.5, 0.09, kind='tri', k=3, rev=0.4)
+    chord = np.zeros(int(3.0 * SR))
+    for fr in (261.63, 329.63, 392.0, 523.25):
+        chord += osc('tri', fr, 3.0)
+    put(chord * env(len(chord), a=0.05, k=0.9) * 0.07, g0 + 4.2, 1, rev=0.5)
+
+    # ---------- Maquina de escribir (HUD) ----------
+    for si, sc in enumerate(SCENES):
+        nchar = len(sc['title']) + len(sc['desc']) + len(sc['q'])
+        for k in range(0, nchar, 3):
+            tt_ = STARTS[si] + 0.2 + TYPE_START - 0.2 + k / TYPE_CPS
+            if tt_ > STARTS[si] + sc['dur'] - 0.4: break
+            beep(tt_, 1500 + 200 * (k % 3), 0.012, 0.03, duty=0.25, k=40)
+
+def xenon_audio():
+    g = 6.0
+    put(filt(osc('saw', 52.0, 13.0), 'low', 200) * 0.11, g, 1)
+    clicks(g, g + 13, lambda tt: 4 + 60 * min(1, xe_power(tt - g) / 700.0), g=0.13, seed=21)
+    n = int(2.8 * SR)
+    put(osc('sine', np.linspace(620, 60, n)) * env(n, a=0.02, k=0.4) * 0.9, g + 1.2, 0.13, rev=0.2)
+    thump(g + 4.0, 0.30); clunk(g + 4.0, 0.25)
+    d = 3.6; n = int(d * SR); tt = np.arange(n) / SR
+    f = 300 + 200 * (tt / d) + 8 * np.sin(tt * 20)
+    put(osc('tri', f) * np.minimum(tt / 0.5, 1) * np.minimum((d - tt) / 0.8, 1) * 0.07, g + 1.5, 1, rev=0.3)
+    rg = np.random.default_rng(31); tc = g + 1.5
+    while tc < g + 10.0:                                   # neutrones absorbidos por xenon
+        tc += rg.exponential(1 / (3 + 11 * xe_xenon(tc - g)))
+        f0 = 900 + rg.random() * 500; n = int(0.05 * SR)
+        put(osc('sine', np.linspace(f0, f0 * 0.45, n)) * env(n, a=0.002, k=45), tc, 0.04,
+            pan=rg.uniform(-.8, .8), rev=0.2)
+    steps = 22
+    for k in range(steps):                                 # barras de control saliendo
+        ts = g + 4.8 + k * 4.2 / steps
+        beep(ts, 520, 0.05, 0.055, duty=0.25, k=20, pan=-0.6)
+        n = int(0.05 * SR)
+        put(filt(noise(0.05), 'band', [300, 1200]) * env(n, a=0.002, k=45), ts, 0.10, pan=-0.2)
+    clunk(g + 4.8, 0.2, -0.5); clunk(g + 9.0, 0.25, -0.5)
+    tw = 7.66
+    while tw < 10.1:                                       # ORM por debajo del minimo
+        beep(g + tw, 880, 0.1, 0.08, duty=0.25, rev=0.15)
+        beep(g + tw + 0.12, 660, 0.1, 0.08, duty=0.25)
+        tw += 0.45
+    tb_ = 4.8
+    while tb_ < 12.4:                                      # latidos de tension
+        thump(g + tb_, 0.18)
+        tb_ += max(0.45, 1.0 - 0.12 * (tb_ - 4.8))
+    siren(g + 10.2, g + 12.6, g, 1000, 700, 0.09)
+    n = int(3.5 * SR)
+    put(filt(osc('saw', np.linspace(110, 35, n)), 'low', 400) * 0.09 * np.minimum(np.arange(n) / (0.2 * SR), 1), g + 9.5, 1)
+    n = int(3.0 * SR); tt = np.linspace(0, 1, n)
+    put(filt(noise(3.0), 'low', 110) * tt ** 1.5 * 0.9, g + 10.0, 0.3)
+    n = int(0.6 * SR)
+    put(osc('sine', np.linspace(300, 2200, n)) * np.linspace(0, 1, n) ** 2 * 0.08, g + 12.4, 1)
+    whoosh(g + 12.55, 0.45, 0.15)
+
+def build_audio(path):
+    music()
+    ir_n = int(1.6 * SR)
+    t_ = np.arange(ir_n) / SR
+    irl = filt(rng.standard_normal(ir_n), 'low', 5000) * np.exp(-t_ * 3.2)
+    irr = filt(rng.standard_normal(ir_n), 'low', 5000) * np.exp(-t_ * 3.2)
+    wl = signal.fftconvolve(RV, irl)[:N] * 0.06
+    wr = signal.fftconvolve(RV, irr)[:N] * 0.06
+    L = AL + wl; R = AR + wr
+    fade = np.minimum(np.arange(N) / (0.15 * SR), 1) * np.minimum((N - np.arange(N)) / (0.7 * SR), 1)
+    L *= fade; R *= fade
+    peak = max(np.abs(L).max(), np.abs(R).max())
+    L = np.tanh(L / peak * 1.35) / np.tanh(1.35)
+    R = np.tanh(R / peak * 1.35) / np.tanh(1.35)
+    st = np.stack([L, R], 1) * 0.89
+    wavfile.write(path, SR, (st * 32767).astype(np.int16))
+
+# =========================================================
+# 4. POST-PROCESO + HUD
+# =========================================================
+F_MONO = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"
+F_BOLD = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf"
+f_tag = ImageFont.truetype(F_MONO, 15)
+f_title = ImageFont.truetype(F_BOLD, 27)
+f_body = ImageFont.truetype(F_MONO, 18)
+
+def wrap(text, font, maxw):
+    lines, cur = [], ''
+    for w in text.split(' '):
+        test = (cur + ' ' + w).strip()
+        if font.getlength(test) <= maxw: cur = test
+        else: lines.append(cur); cur = w
+    lines.append(cur)
+    return lines
+
+for sc in SCENES:
+    sc['desc_l'] = wrap(sc['desc'], f_body, VW - 62)
+    sc['q_l'] = wrap(sc['q'], f_body, VW - 62 - 22)
+
+def reveal(lines, n):
+    out = []
+    for ln in lines:
+        k = max(0, min(len(ln), n)); out.append(ln[:k]); n -= len(ln) + 1
+    return out, max(0, n)
+
+HUD_H = 215
+Y0 = VH - HUD_H
+_g = np.zeros(HUD_H, np.float32)
+for i in range(HUD_H):
+    u = 1 - i / (HUD_H - 1)                      # 0 abajo, 1 arriba
+    _g[i] = 0.97 if u <= 0.45 else (0.97 - (0.97 - 0.80) * (u - 0.45) / 0.33 if u <= 0.78
+                                    else 0.80 * (1 - (u - 0.78) / 0.22))
+GRAD = _g[:, None, None]
+BG = np.array([3, 6, 12], np.float32)
+
+yy, xx = np.mgrid[0:VH, 0:VW].astype(np.float32)
+VIG = (1 - 0.32 * (((xx - VW / 2) / (VW / 2)) ** 2 + ((yy - VH / 2) / (VH / 2)) ** 2) / 2)[..., None]
+SCAN = np.ones((VH, 1, 1), np.float32)
+SCAN[(np.arange(VH) % 4) < 2] = 0.87
+
+def locate(elapsed):
+    for i, sc in enumerate(SCENES):
+        if elapsed < STARTS[i] + sc['dur'] or i == len(SCENES) - 1:
+            return i, elapsed - STARTS[i]
+
+def fmt(s): return f"{int(s // 60):02d}:{int(s % 60):02d}"
+
+def draw_hud(frame, idx, local, elapsed):
+    sc = SCENES[idx]
+    ah = min(max((local - 0.2) / 0.25, 0), 1) * min(max((sc['dur'] - local) / 0.25, 0), 1)
+    if ah > 0.01:
+        reg = frame[Y0:VH].astype(np.float32)
+        ga = GRAD * ah
+        reg = reg * (1 - ga) + BG * ga
+        img = Image.fromarray(reg.astype(np.uint8)).convert('RGBA')
+        ov = Image.new('RGBA', img.size, (0, 0, 0, 0))
+        d = ImageDraw.Draw(ov)
+        A = int(255 * ah)
+        d.text((31, 26), sc['tag'], font=f_tag, fill=(34, 211, 238, A))
+        d.text((VW // 2, 26), f"{fmt(elapsed)} / {fmt(TOTAL)}", font=f_tag, fill=(34, 211, 238, A), anchor='ma')
+        if (elapsed % 1.0) < 0.5:
+            d.ellipse((VW - 31 - 58 - 14, 28, VW - 31 - 58, 42), fill=(239, 68, 68, A))
+        d.text((VW - 31, 26), "REC", font=f_tag, fill=(239, 68, 68, A), anchor='ra')
+        n = max(0, int((local - TYPE_START) * TYPE_CPS))
+        tt = sc['title'][:n]; n -= len(sc['title'])
+        d.text((33, 60), tt, font=f_title, fill=(0, 0, 0, A))
+        d.text((31, 58), tt, font=f_title, fill=(250, 204, 21, A))
+        dl, n = reveal(sc['desc_l'], n)
+        yb = 104
+        for ln in dl:
+            d.text((31, yb), ln, font=f_body, fill=(203, 213, 225, A)); yb += 27
+        yb += 8
+        ql, n = reveal(sc['q_l'], n)
+        qh = 27 * len(sc['q_l']) + 12
+        d.rectangle((31, yb, VW - 31, yb + qh), fill=(34, 211, 238, int(15 * ah)))
+        d.rectangle((31, yb, 35, yb + qh), fill=(34, 211, 238, A))
+        for ln in ql:
+            d.text((31 + 18, yb + 6), ln, font=f_body, fill=(103, 232, 249, A)); yb += 27
+        img = Image.alpha_composite(img, ov).convert('RGB')
+        frame[Y0:VH] = np.array(img)
+    # barra de progreso
+    frame[0:8] = (frame[0:8] * 0.92 + 255 * 0.08).astype(np.uint8)
+    frame[0:8, :int(VW * elapsed / TOTAL)] = (34, 211, 238)
+
+def render_frame(fi):
+    elapsed = fi / FPS
+    idx, local = locate(elapsed)
+    fx.update(shift=(0, 0), bloom=1.0, chroma=0.0)
+    buf[:] = 0
+    DRAW[idx](local)
+    img = buf
+    dx, dy = fx['shift']
+    if dx or dy:
+        pad = 6
+        p = cv2.copyMakeBorder(img, pad, pad, pad, pad, cv2.BORDER_REPLICATE)
+        img = p[pad - dy:pad - dy + H, pad - dx:pad - dx + W]
+    img = np.ascontiguousarray(img)
+    big = cv2.resize(img, (VW, VH), interpolation=cv2.INTER_NEAREST)
+    bright = np.clip(img - 150, 0, None)
+    bl = cv2.GaussianBlur(bright, (0, 0), 2.0)
+    bl = cv2.resize(bl, (VW, VH), interpolation=cv2.INTER_LINEAR)
+    big = big + bl * 0.55 * fx['bloom']
+    if fx['chroma'] > 0.02:
+        s = max(1, int(fx['chroma'] * 5))
+        big[..., 0] = np.roll(big[..., 0], s, axis=1)
+        big[..., 2] = np.roll(big[..., 2], -s, axis=1)
+    big = big * SCAN * VIG
+    fade = min(1.0, local / 0.2) * min(1.0, (TOTAL - elapsed) / 0.6)
+    frame = np.clip(big * fade, 0, 255).astype(np.uint8)
+    draw_hud(frame, idx, local, elapsed)
+    return frame
+
+# =========================================================
+# 5. MAIN
+# =========================================================
+def main():
+    tmp = tempfile.mkdtemp()
+    wav = os.path.join(tmp, "audio.wav")
+    print("Sintetizando audio...", flush=True)
+    build_audio(wav)
+    cmd = ["ffmpeg", "-y", "-loglevel", "error",
+           "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{VW}x{VH}", "-r", str(FPS), "-i", "-",
+           "-i", wav,
+           "-c:v", "libx264", "-preset", "medium", "-crf", "18", "-pix_fmt", "yuv420p",
+           "-c:a", "aac", "-b:a", "192k", "-shortest", "-movflags", "+faststart",
+           "-metadata", "title=Inspeccion de Seguridad - Chernobyl y Fukushima (8-bit)",
+           "-metadata", f"comment=1280x720 {FPS}fps {TOTAL}s H.264+AAC, pixel-art 160x90 x8, audio procedural",
+           OUT]
+    pr = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+    for fi in range(NFR):
+        pr.stdin.write(render_frame(fi).tobytes())
+        if fi % 150 == 0: print(f"frame {fi}/{NFR}", flush=True)
+    pr.stdin.close(); pr.wait()
+    print("Listo:", OUT)
+
+if __name__ == "__main__":
+    main()
